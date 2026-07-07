@@ -1,0 +1,477 @@
+Improvement Audit: blog/recommender.py (Recommender class)
+===============================================================
+
+Scope
+------
+This document enumerates performance, correctness, maintainability, and recommendation-quality improvements for:
+- Recommender.get_personalized_feed()
+- Recommender.get_popular_feed()
+- Recommender._post_to_dict()
+
+Each suggestion includes: WHY, HOW, PROS, CONS, and includes code snippets where improvements are needed.
+
+----------------------------------------------------------------
+1) Cross-cutting / structural improvements (whole class)
+----------------------------------------------------------------
+
+1.1 Separate concerns (DB access vs feature building vs ranking)
+WHY
+- Current get_personalized_feed mixes DB queries, NLP preprocessing, vectorization, profile building, and ranking.
+- This makes optimization and unit testing difficult.
+
+HOW
+- Refactor into helper methods:
+  - _load_user_likes(user_id) -> liked_posts, liked_ids
+  - _load_candidate_posts(candidate_pool_size) -> all_posts
+  - _build_documents(posts) -> list[str]
+  - _build_vectorizer(documents) OR use cached precomputed model
+  - _build_user_profile(liked_posts, tfidf_matrix, id_to_idx) -> profile vector
+  - _rank_posts(profile_vec, tfidf_matrix, all_posts, limit) -> list[(score, post)]
+
+PROS
+- Testability, readability, easier profiling of each step.
+- Cleaner future algorithm swaps.
+
+CONS
+- More code, refactor effort.
+
+Code snippet (current structure problem)
+--------------------------------------
+```py
+# inside get_personalized_feed:
+# 1) load liked posts
+# 2) load all candidate posts
+# 3) create documents
+# 4) fit vectorizer
+# 5) build user profile
+# 6) compute similarities
+# 7) compute scores
+# 8) sort and return
+```
+
+1.2 Cache expensive computations
+WHY
+- TF-IDF vectorizer is fit on every request (fit_transform).
+- For candidate_pool_size=300, this is heavy and increases latency.
+
+HOW
+- Precompute and cache:
+  - vectorizer (vocabulary + idf)
+  - document vectors for posts
+  - or use a scheduled recomputation / invalidation strategy.
+
+Options
+- Cache per “candidate window” (e.g., last N posts) if you insist on recency-limited retrieval.
+- Better: precompute on a stable corpus (or periodic rebuild) and store vectors.
+
+PROS
+- Massive latency reduction and CPU savings.
+
+CONS
+- Cache invalidation complexity when posts/categories update.
+- Memory footprint may increase.
+
+1.3 Parameterize “magic numbers”
+WHY
+- Hard-coded values: candidate pool size=300, weights 0.7 and 0.015, stop_words='english', max_features=500.
+- Makes it hard to tune or A/B test.
+
+HOW
+- Introduce configuration:
+  - candidate_pool_size
+  - content_weight / popularity_weight
+  - tfidf parameters (max_features, ngram_range)
+
+PROS
+- Faster iteration, better experimentation.
+
+CONS
+- Requires configuration management.
+
+----------------------------------------------------------------
+2) Recommender.get_personalized_feed() improvements
+----------------------------------------------------------------
+
+2.1 Correctness & performance: liked-post to candidate-index mapping
+Current code (problematic)
+---------------------------
+```py
+user_vectors = []
+for liked in liked_posts:
+    for idx, p in enumerate(all_posts):
+        if p.id == liked.id:
+            user_vectors.append(tfidf_matrix[idx].toarray()[0])
+            break
+```
+
+WHY (correctness)
+- all_posts is limited to the latest 300 by created_at.
+- If a user liked an older post outside the candidate set, it won’t contribute to the user profile.
+- That changes user preference representation toward “recent liked posts within candidate window”.
+
+WHY (performance)
+- Nested loops O(#liked * #candidate).
+- Repeated `.toarray()` allocations inside loops.
+
+HOW
+- Build an id_to_idx mapping once:
+  - id_to_idx = {post.id: idx for idx, post in enumerate(all_posts)}
+- Select liked vectors by index directly (only those liked posts present in candidate set).
+- Avoid `.toarray()` in loops.
+
+PROS
+- Removes nested loops.
+- Makes inclusion/exclusion of liked posts explicit.
+- Big speedup.
+
+CONS
+- You still have a “candidate coverage” limitation unless you expand candidate_pool_size or incorporate a global index.
+
+2.2 Build user profile without converting sparse -> dense repeatedly
+Current code (problematic)
+---------------------------
+```py
+user_vectors.append(tfidf_matrix[idx].toarray()[0])
+user_profile = np.mean(user_vectors, axis=0).reshape(1, -1)
+```
+
+WHY
+- `.toarray()` creates dense vectors repeatedly.
+- TF-IDF matrices are sparse; densifying increases memory and CPU.
+
+HOW
+- Keep sparse operations as much as possible.
+- If using cosine_similarity, consider using sparse-compatible implementations or compute mean in sparse form.
+- Alternatively, compute user_profile as a sparse row by averaging sparse rows:
+  - user_profile = tfidf_matrix[liked_indices].mean(axis=0)  (if supported as sparse)
+
+PROS
+- Lower memory usage, faster.
+
+CONS
+- Some sklearn APIs may require dense matrices depending on version.
+
+2.3 Avoid fitting vectorizer on candidate documents each request
+Current code
+-------------
+```py
+vectorizer = TfidfVectorizer(stop_words='english', max_features=500)
+tfidf_matrix = vectorizer.fit_transform(documents)
+```
+
+WHY
+- Every request re-learns vocabulary/IDF from only the candidate set.
+- Similarities become non-stationary: token weights differ per request.
+- Computationally expensive.
+
+HOW
+- Pre-fit TF-IDF on a larger corpus (ideally all posts or a long-lived subset).
+- Persist vectorizer and use transform for candidate documents.
+- Also consider precomputing candidate document vectors for each post.
+
+PROS
+- Stable representation; faster runtime.
+
+CONS
+- More complexity, cache invalidation.
+
+2.4 Feature engineering: separate content features from category features
+Current approach
+----------------
+```py
+cats = " ".join([c.name for c in p.categories])
+documents.append(f"{p.content} {cats}")
+```
+
+WHY
+- Categories are short structured tokens; mixing them into content makes their influence depend on token frequencies and stopword behavior.
+- It becomes hard to tune “category importance” separately from content.
+
+HOW
+- Use two vectorizers:
+  - content_tfidf on p.content
+  - category_tfidf on category tokens (optionally prefixed to avoid collisions)
+- Compute:
+  - sim = w_content * cosine(profile_content, content_matrix) + w_cat * cosine(profile_cat, cat_matrix)
+
+PROS
+- Better control; likely better recommendation quality.
+
+CONS
+- More computation/model code.
+
+2.5 Add recency weighting to user profile
+WHY
+- Current profile = mean of liked vectors (all liked equally).
+- User taste often shifts over time.
+
+HOW
+- If you have timestamps of likes, weight by time decay:
+  - weight_i = exp(-age_days / tau)
+- You only have post.created_at in current schema, not like timestamp.
+  - Improvement: add PostLike model with created_at/interaction timestamp or store like events.
+
+PROS
+- Captures evolving preferences.
+
+CONS
+- Requires schema/data changes.
+
+2.6 Improve popularity blending: normalize like_count and consider time-decay
+Current scoring
+---------------
+```py
+score = float(similarities[i]) * 0.7 + (post.like_count * 0.015)
+```
+
+WHY
+- Like_count scale can dominate or distort similarity.
+- Like_count is not normalized; distribution across posts may be skewed.
+
+HOW
+- Normalize like_count:
+  - log1p(like_count)
+  - min-max scaling within candidate set
+  - z-score using global stats
+- Add time-decay:
+  - like_count / (age_hours+1)^gamma
+
+PROS
+- More calibrated ranking; less “always viral”.
+
+CONS
+- Needs tuning of gamma/weights.
+
+2.7 Exclude already-liked posts (optional novelty constraint)
+WHY
+- Many feed UX patterns avoid recommending already-liked content.
+
+HOW
+- Filter in DB query:
+  - Post.id.notin_(liked_ids)
+- Make behavior configurable:
+  - allow_duplicates=False by default
+
+PROS
+- Better novelty and perceived relevance.
+
+CONS
+- Some users may enjoy re-reading; personalization might reduce satisfaction for those patterns.
+
+2.8 Two-stage ranking (retrieval + rerank)
+WHY
+- Current approach uses TF-IDF cosine over a recency-limited candidate set.
+- For better recall, retrieval stage should be broader.
+
+HOW
+- Stage 1 retrieval:
+  - candidate_pool_size large (e.g., 2000) using faster retrieval
+- Stage 2 rerank:
+  - apply more expensive scoring (hybrid model, engagement-normalized score, etc.)
+
+PROS
+- Improved recall and personalization.
+
+CONS
+- More compute.
+
+----------------------------------------------------------------
+3) Recommender.get_popular_feed() improvements
+----------------------------------------------------------------
+
+3.1 Popularity ranking should include freshness (optional)
+Current code
+-------------
+```py
+order_by(Post.like_count.desc(), Post.created_at.desc())
+```
+
+WHY
+- Pure like_count locks in older viral posts.
+
+HOW
+- Use time-decayed like score:
+  - score = like_count / (age_hours+1)^gamma
+- If you can’t compute age in SQL easily, fetch subset and compute in Python.
+
+PROS
+- Fresher “trending” feed.
+
+CONS
+- More complexity and tuning.
+
+3.2 Consider confidence/low-sample bias
+WHY
+- A post with 1 like is treated as equal relative to 100 likes unless sorted; but with small like counts it may still appear early if ties happen.
+
+HOW
+- Use Bayesian average / Wilson score if votes exist.
+- Current schema only has like_count; you can still use log1p scaling or minimum thresholds.
+
+PROS
+- Better fairness.
+
+CONS
+- Requires tuning or additional statistics.
+
+----------------------------------------------------------------
+4) Recommender._post_to_dict() improvements
+----------------------------------------------------------------
+
+4.1 Ensure response contract consistency with schemas
+Current dict
+------------
+```py
+return {
+  "id": post.id,
+  "user_id": post.user_id,
+  "content": post.content,
+  "created_at": post.created_at,
+  "like_count": post.like_count,
+  "categories": [c.name for c in getattr(post, 'categories', [])],
+  "is_liked": False
+}
+```
+
+WHY
+- Main.py overrides is_liked after calling recommender.
+- Potential duplication of responsibility.
+
+HOW
+- Either:
+  - recommender should set is_liked based on a passed-in liked_ids_set
+  - or recommender returns is_liked omitted/false and API always overrides (document this clearly)
+
+PROS
+- Clear ownership of “is_liked” semantics.
+
+CONS
+- API changes if you alter return keys.
+
+4.2 Avoid getattr defensive programming if categories are guaranteed loaded
+WHY
+- getattr costs a tiny amount; also reduces clarity.
+
+HOW
+- Since you use selectinload in feed queries, you can rely on post.categories existing.
+- Keep defensive code only if you sometimes call _post_to_dict without eager loading.
+
+PROS
+- Cleaner + slightly faster.
+
+CONS
+- Less defensive if future code paths forget selectinload.
+
+----------------------------------------------------------------
+5) Concrete refactor suggestions with code blocks (targets)
+----------------------------------------------------------------
+
+5.1 Replace nested liked-to-all-post index search
+Current (replace)
+-----------------
+```py
+for liked in liked_posts:
+    for idx, p in enumerate(all_posts):
+        if p.id == liked.id:
+            user_vectors.append(tfidf_matrix[idx].toarray()[0])
+            break
+```
+
+Target approach (conceptual)
+-----------------------------
+```py
+id_to_idx = {p.id: i for i, p in enumerate(all_posts)}
+liked_indices = [id_to_idx[l.id] for l in liked_posts if l.id in id_to_idx]
+# then derive user_profile from tfidf_matrix[liked_indices] without per-item toarray
+```
+
+5.2 Vectorize ranking without Python loops
+Current (replace)
+-----------------
+```py
+scored = []
+for i, post in enumerate(all_posts):
+    score = float(similarities[i]) * 0.7 + (post.like_count * 0.015)
+    scored.append((score, post))
+scored.sort(reverse=True, key=lambda x: x[0])
+recommended = [self._post_to_dict(p) for _, p in scored[:limit]]
+```
+
+Target approach (conceptual)
+-----------------------------
+- popularity = normalized_like_count_array for posts
+- scores = α * similarities + β * popularity
+- pick top-k via numpy argpartition or argsort
+
+PROS
+- Faster and cleaner.
+
+CONS
+- Slight complexity; ensure deterministic ordering for ties.
+
+5.3 Avoid fitting TF-IDF per request (transform only)
+Current
+-------
+```py
+vectorizer = TfidfVectorizer(...)
+tfidf_matrix = vectorizer.fit_transform(documents)
+```
+
+Target (conceptual)
+--------------------
+- vectorizer fitted once (stored on instance/class/global cache)
+- tfidf_matrix = vectorizer.transform(documents)
+
+5.4 Introduce configuration object / constants
+WHY
+- Avoid “magic numbers”.
+
+Target (conceptual)
+--------------------
+```py
+class RecommenderConfig:
+    candidate_pool_size = 300
+    tfidf_max_features = 500
+    tfidf_stop_words = 'english'
+    weight_similarity = 0.7
+    weight_popularity = 0.015
+```
+
+----------------------------------------------------------------
+6) Additional “nice to have” improvements
+----------------------------------------------------------------
+
+6.1 Deterministic output ordering
+WHY
+- When scores tie, sort ordering might depend on Python sort stability and input order.
+HOW
+- Add consistent tie-breakers (e.g., created_at desc then id desc).
+
+6.2 Add evaluation metrics and logging
+WHY
+- Without offline/online metrics, improvements are guesswork.
+HOW
+- Track:
+  - latency per request
+  - top-k diversity
+  - acceptance/like rate per recommended rank
+  - coverage of candidate pool
+
+6.3 Consider embeddings over TF-IDF for better semantic match
+WHY
+- TF-IDF is lexical; can miss semantic similarity.
+HOW
+- Use sentence transformers embeddings + ANN index (FAISS).
+PROS: better semantic relevance.
+CONS: additional dependencies and memory.
+
+----------------------------------------------------------------
+7) Summary of highest ROI actions
+----------------------------------------------------------------
+1) Remove nested liked-post indexing and avoid repeated toarray() allocations.
+2) Cache/precompute TF-IDF vectorizer + document vectors (or move to embeddings).
+3) Normalize and time-decay like_count before blending with similarity.
+4) Split content features from category features for tunable ranking quality.
+5) Vectorize scoring to avoid Python loops.
+
+End of audit.
