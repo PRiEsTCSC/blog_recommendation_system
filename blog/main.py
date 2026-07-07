@@ -24,8 +24,16 @@ def post_to_response(post):
         "categories": [c.name for c in getattr(post, 'categories', [])]
     }
 
+
+# ROUTES
 @app.post("/users/", response_model=UserResponse)
 def create_user(data: UserCreate):
+    """
+    Place holder for testing. This creates a user. And can be altered or outsourced
+    
+    :param data: UserCreate model
+    :type data: UserCreate
+    """
     try:
         user = db.create_user(data.username, data.password)
         return user
@@ -34,6 +42,15 @@ def create_user(data: UserCreate):
 
 @app.post("/posts/", response_model=PostResponse)
 def create_post(data: PostCreate, user_id: int):
+    """
+    Create Post.
+    This can be altered as it is just a prototype and a place holder
+    
+    :param data: Description
+    :type data: The postcreate data model
+    :param user_id: User ID
+    :type user_id: int
+    """
     if not db.get_user_by_id(user_id):
         raise HTTPException(404, "User not found")
     post = db.create_post(user_id, data.content, data.categories, data.media_type)
@@ -41,11 +58,25 @@ def create_post(data: PostCreate, user_id: int):
 
 @app.get("/feed/", response_model=List[PostResponse])
 def get_general_feed(limit: int = 20):
+    """
+    Get post generally with popular and recent posts given priority
+    
+    :param limit: Number of posts expected in the response, default  = 20
+    :type limit: int
+    """
     posts = db.get_all_posts(limit)
     return [post_to_response(p) for p in posts]
 
 @app.get("/feed/personal/", response_model=List[PostResponse])
 def get_personal_feed(user_id: int, limit: int = 20):
+    """
+    Get personal feed for the user specified in the user_id
+    
+    :param user_id: User ID
+    :type user_id: int
+    :param limit: Number of posts expected in the response, default  = 20
+    :type limit: int
+    """
     posts_dicts = recommender.get_personalized_feed(user_id, limit)
     liked_ids = db.get_user_liked_post_ids(user_id)
     for p in posts_dicts:
@@ -54,6 +85,14 @@ def get_personal_feed(user_id: int, limit: int = 20):
 
 @app.post("/posts/{post_id}/like/")
 def toggle_like(post_id: int, user_id: int):
+    """
+    Like or Unlike a post
+    
+    :param post_id: Post ID
+    :type post_id: int
+    :param user_id: User ID
+    :type user_id: int
+    """
     try:
         return db.toggle_like(user_id, post_id)
     except ValueError:
@@ -62,7 +101,12 @@ def toggle_like(post_id: int, user_id: int):
 
 @app.get("/users/{user_id}/likes/", response_model=UserLikesResponse)
 def get_user_likes(user_id: int):
-    """Get all liked post IDs and aggregated liked categories for a user"""
+    """
+    Get all liked post IDs and aggregated liked categories for a user
+    
+    :param user_id: User ID
+    :type user_id: int
+"""
     if not db.get_user_by_id(user_id):
         raise HTTPException(404, "User not found")
     

@@ -1,7 +1,13 @@
 # Blog Recommendation System
 
+## Note that the main purpose of this project is the Blog Recommendation, the User management and Post creation can be altered as you like as they are not standard in any form
 
-**Base**
+
+
+<br><br>
+
+
+**Base Url**
 - Host: `http://127.0.0.1:8000`
 
 ## How to run
@@ -9,83 +15,11 @@
 uvicorn blog.main:app --reload --port 8000
 ```
 
-## Schemas (Pydantic)
-
-### 1) UserCreate
-**Request body (POST /users/)**
-
-```json
-{
-  "username": "string",
-  "password": "string"
-}
+## How to get the proper Documentation with Swagger UI 
+```bash
+http://127.0.0.1:8000/docs/
 ```
-
-### 2) UserResponse
-**Response body (POST /users/)**
-
-```json
-{
-  "id": 1,
-  "username": "string"
-}
-```
-
-### 3) PostCreate
-**Request body (POST /posts/)**
-
-```json
-{
-  "content": "string",
-  "categories": ["string"],
-  "media_type": "text"
-}
-```
-
-**Notes:**
-- `categories` defaults to `[]`
-- `media_type` defaults to `"text"`
-
-### 4) PostResponse
-**Response body (GET /feed/, GET /feed/personal/, POST /posts/)**
-
-```json
-{
-  "id": 1,
-  "user_id": 1,
-  "content": "string",
-  "created_at": "2026-07-04T14:30:00Z",
-  "like_count": 0,
-  "is_liked": false,
-  "categories": ["string"]
-}
-```
-
-### 5) UserLikesResponse
-**Response body (GET /users/{user_id}/likes/)**
-
-```json
-{
-  "liked_post_ids": [1, 2, 3],
-  "liked_categories": ["string", "string"]
-}
-```
-
-## Error Format
-
-The app relies mostly on FastAPI’s default error shape.
-
-- HTTPException responses are:
-  ```json
-  {
-    "detail": "<message>"
-  }
-  ```
-
-**Examples:**
-- 404: "User not found"
-- 404: "Post not found"
-- 400: server-provided message via `HTTPException(400, str(e))`
+<br><br>
 
 ## Endpoints
 
