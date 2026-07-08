@@ -27,9 +27,9 @@ class Recommender:
 
         # First things first we check if the user exists
         #TODO: Remove this later, it is unnecessary
-        user: User | None = self.db.get_user_by_id(user_id)
-        if not user:
-            return self.get_popular_feed(limit)
+        # user: User | None = self.db.get_user_by_id(user_id)
+        # if not user:
+        #     return self.get_popular_feed(limit)
 
         
         # Getting the IDs of a user's liked posts
